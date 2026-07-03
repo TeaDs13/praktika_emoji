@@ -11,7 +11,7 @@ from src.model import get_model
 from src.train import train_one_epoch
 from src.evaluate import evaluate
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device("cuda" if torch.backends.mps.is_available() else "cpu")
 
 # 1. transforms
 train_tf, test_tf = get_transforms()

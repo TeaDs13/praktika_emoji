@@ -10,7 +10,7 @@ def evaluate(model, loader, criterion, device):
 
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device).float(), y.to(device).long()
 
             outputs = model(x)
             loss = criterion(outputs, y)

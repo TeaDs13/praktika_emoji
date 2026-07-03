@@ -6,7 +6,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     total = 0
 
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device).float(), y.to(device).long()
 
         optimizer.zero_grad()
 

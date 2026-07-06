@@ -1,3 +1,6 @@
+import torch
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
 
@@ -6,7 +9,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     total = 0
 
     for x, y in loader:
-        x, y = x.to(device).float(), y.to(device).long()
+        x, y = x.to(device), y.to(device)
 
         optimizer.zero_grad()
 
@@ -14,12 +17,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         loss = criterion(outputs, y)
 
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * x.size(0)
 
-        _, pred = outputs.max(1)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == y).sum().item()
         total += y.size(0)
-        correct += (pred == y).sum().item()
 
-    return total_loss / len(loader), correct / total
+    return total_loss / total, correct / total

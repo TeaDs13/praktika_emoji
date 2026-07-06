@@ -1,74 +1,146 @@
 import torch
 import torch.nn as nn
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-class EmotionCNN(nn.Module):
-    def __init__(self, num_classes=7):
-        super(EmotionCNN, self).__init__()
-        
-        # Блок 1: Вход (1, 48, 48) -> Выход (64, 24, 24)
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.drop1 = nn.Dropout2d(p=0.25)
+# =========================
+# CBAM
+# =========================
 
-        # Блок 2: Вход (64, 24, 24) -> Выход (128, 12. 12)
-        self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.drop2 = nn.Dropout2d(p=0.25)
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
 
-        # Блок 3: Вход (128, 12, 12) -> Выход (256, 6, 6)
-        self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(256)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.drop3 = nn.Dropout2d(p=0.25)
-        
-        # Блок 4: Вход (256, 6, 6) -> Выход (512, 3, 3)
-        self.conv4 = nn.Conv2d(in_channels=256, out_channels=512, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(512)
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.drop4 = nn.Dropout2d(p=0.25)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        # Полносвязные слои (Classifiers)
-        # После 4-х пулингов (размер уменьшается в 2^4 = 16 раз): 48 / 16 = 3. 
-        # Размер тензора перед Flatten: 512 каналов * 3 * 3
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(512 * 3 * 3, 512)
-        self.bn_fc1 = nn.BatchNorm1d(512)
-        self.drop_fc1 = nn.Dropout(p=0.5)
-        
-        self.fc2 = nn.Linear(512, 256)
-        self.bn_fc2 = nn.BatchNorm1d(256)
-        self.drop_fc2 = nn.Dropout(p=0.5)
-        
-        # Выходной слой на 7 классов (без Softmax, так как используется CrossEntropyLoss)
-        self.fc3 = nn.Linear(256, num_classes)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels)
+        )
+
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Проход через сверточные блоки
-        x = self.drop1(self.pool1(F.relu(self.bn1(self.conv1(x)))))
-        x = self.drop2(self.pool2(F.relu(self.bn2(self.conv2(x)))))
-        x = self.drop3(self.pool3(F.relu(self.bn3(self.conv3(x)))))
-        x = self.drop4(self.pool4(F.relu(self.bn4(self.conv4(x)))))
-        
-        # Вытягивание в 1D вектор
-        x = self.flatten(x)
-        
-        # Проход через полносвязные слои
-        x = self.drop_fc1(F.relu(self.bn_fc1(self.fc1(x))))
-        x = self.drop_fc2(F.relu(self.bn_fc2(self.fc2(x))))
-        x = self.fc3(x)
-        
+        b, c, _, _ = x.size()
+
+        avg = self.mlp(self.avg_pool(x).view(b, c))
+        max_ = self.mlp(self.max_pool(x).view(b, c))
+
+        out = avg + max_
+        return self.sigmoid(out).view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = torch.mean(x, dim=1, keepdim=True)
+        max_, _ = torch.max(x, dim=1, keepdim=True)
+
+        x = torch.cat([avg, max_], dim=1)
+        x = self.conv(x)
+
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.ca = ChannelAttention(channels)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
         return x
 
+
+# =========================
+# Residual + CBAM Block
+# =========================
+
+class ResidualCBAMBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.cbam = CBAM(out_channels)
+
+        # shortcut (skip connection)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+
+        x = self.cbam(x)
+
+        x = x + residual
+        return F.relu(x)
+
+
+# =========================
+# FULL MODEL
+# =========================
+
+class EmotionResCBAM(nn.Module):
+    def __init__(self, num_classes=7):
+        super().__init__()
+
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+
+        # Residual stages
+        self.layer1 = ResidualCBAMBlock(64, 64)
+        self.layer2 = ResidualCBAMBlock(64, 128, stride=2)
+        self.layer3 = ResidualCBAMBlock(128, 256, stride=2)
+
+        # Pooling
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.dropout = nn.Dropout(p=0.4)
+
+        # Classifier
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+
+        return self.fc(x)
+
+
+# =========================
+# GET MODEL
+# =========================
+
 def get_model(num_classes, device):
-    # Создаем экземпляр нашей кастомной сети
-    model = EmotionCNN(num_classes=num_classes)
-    
-    # Отправляем модель на нужное устройство (CPU, GPU или MPS)
-    model = model.to(device)
-    
-    return model
+    model = EmotionResCBAM(num_classes)
+    return model.to(device)
